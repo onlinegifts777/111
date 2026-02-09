@@ -1,0 +1,188 @@
+# .github/workflows/main.yml
+name: Ghost Intelligence Swarm Email Sender
+
+on:
+  workflow_dispatch: # Позволяет запускать вручную из интерфейса GitHub
+    inputs:
+      total_target_emails:
+        description: 'Общее количество писем для отправки (целей из base.txt). Введите 0 для отправки всей базы.'
+        required: true
+        default: '0'
+      test_mode_enabled:
+        description: 'Включить тестовый режим (отправка только на TEST_EMAILS из config.py)'
+        type: boolean
+        required: true
+        default: true
+      max_parallel_runners:
+        description: 'Максимальное количество параллельных GHA-ранеров (чем больше, тем быстрее, но дороже)'
+        required: true
+        default: '5' # Начни с 2-5 для теста. Для боевого режима можно довести до 20-50 (или выше, если платный аккаунт GHA).
+      
+jobs:
+  # Этот job разделяет цели на пачки и подготавливает матрицу для параллельных запусков
+  prepare_dispatch:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set_matrix.outputs.matrix }}
+      all_accounts_content: ${{ steps.load_accounts.outputs.content }}
+      is_test_mode: ${{ github.event.inputs.test_mode_enabled }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Загрузка всех аккаунтов
+        id: load_accounts
+        run: |
+          ACCOUNTS_CONTENT=$(cat resources/accounts.txt)
+          echo "::set-output name=content::$ACCOUNTS_CONTENT"
+          echo "Аккаунты загружены. Количество строк: $(echo "$ACCOUNTS_CONTENT" | wc -l)"
+
+      - name: Загрузка config.py для доступа к BATCH_SIZE_PER_RUNNER
+        run: |
+          cp config.py .
+          # Извлекаем BATCH_SIZE_PER_RUNNER из config.py
+          BATCH_SIZE=$(grep -oP 'BATCH_SIZE_PER_RUNNER = \K\d+' config.py)
+          echo "BATCH_SIZE_PER_RUNNER=$BATCH_SIZE" >> $GITHUB_ENV
+          echo "BATCH_SIZE_PER_RUNNER: $BATCH_SIZE"
+
+      - name: Подготовка целей для рассылки
+        id: prepare_targets
+        run: |
+          TARGETS_TO_PROCESS_FILE="targets_to_process.txt"
+          if [ "${{ github.event.inputs.test_mode_enabled }}" == "true" ]; then
+            echo "Работаем в тестовом режиме. Получатели будут взяты из config.py -> TEST_EMAILS."
+            # В тестовом режиме mailer_worker.py сам переключится на TEST_EMAILS
+            # Поэтому мы просто создаем пустой файл, он будет проигнорирован.
+            touch "$TARGETS_TO_PROCESS_FILE"
+          else
+            # Боевой режим: читаем base.txt
+            TARGETS_FILE="resources/base.txt"
+            if [ ! -f "$TARGETS_FILE" ]; then
+              echo "Ошибка: Файл базы получателей $TARGETS_FILE не найден."
+              exit 1
+            fi
+            
+            TOTAL_TARGETS=$(wc -l < "$TARGETS_FILE")
+            echo "Всего получателей в base.txt: $TOTAL_TARGETS"
+
+            REQUESTED_TARGETS=${{ github.event.inputs.total_target_emails }}
+            if [ "$REQUESTED_TARGETS" -eq 0 ] || [ "$REQUESTED_TARGETS" -gt "$TOTAL_TARGETS" ]; then
+                # Отправляем всю базу
+                echo "Отправка всей базы получателей."
+                cat "$TARGETS_FILE" > "$TARGETS_TO_PROCESS_FILE"
+            else
+                # Отправляем указанное количество
+                echo "Отправка $REQUESTED_TARGETS получателей."
+                head -n "$REQUESTED_TARGETS" "$TARGETS_FILE" > "$TARGETS_TO_PROCESS_FILE"
+            fi
+          fi
+          
+          # Если файл пуст, то wc -l вернет 0
+          PROCESSED_TARGETS_COUNT=$(wc -l < "$TARGETS_TO_PROCESS_FILE")
+          echo "Подготовлено получателей: $PROCESSED_TARGETS_COUNT"
+          
+          # Сохраняем файл как артефакт, чтобы можно было посмотреть, что было отправлено
+          echo "::set-output name=processed_targets_file::$TARGETS_TO_PROCESS_FILE"
+
+
+      - name: Создание матрицы для GHA ранеров
+        id: set_matrix
+        run: |
+          BATCH_SIZE=${{ env.BATCH_SIZE_PER_RUNNER }}
+          IS_TEST_MODE="${{ github.event.inputs.test_mode_enabled }}"
+          TARGETS_FILE_PATH="${{ steps.prepare_targets.outputs.processed_targets_file }}"
+          
+          MATRIX_CONFIG_ITEMS=""
+          RUNNER_ID=1
+
+          if [ "$IS_TEST_MODE" == "true" ]; then
+            # В тестовом режиме запускаем ОДИН ранер, который сам будет использовать TEST_EMAILS
+            MATRIX_CONFIG_ITEMS="{\"runner_id\": 1, \"targets_offset\": 0, \"targets_limit\": ${BATCH_SIZE}}"
+          elif [ -s "$TARGETS_FILE_PATH" ]; then # Проверяем, что файл не пустой
+            TOTAL_TARGETS=$(wc -l < "$TARGETS_FILE_PATH")
+            echo "Всего целей для разбивки на пачки: $TOTAL_TARGETS"
+            
+            OFFSET=0
+            while [ "$OFFSET" -lt "$TOTAL_TARGETS" ]; do
+                MATRIX_CONFIG_ITEMS+="{\"runner_id\": ${RUNNER_ID}, \"targets_offset\": ${OFFSET}, \"targets_limit\": ${BATCH_SIZE}},"
+                OFFSET=$((OFFSET + BATCH_SIZE))
+                ((RUNNER_ID++))
+            done
+            # Удаляем последнюю запятую
+            MATRIX_CONFIG_ITEMS=${MATRIX_CONFIG_ITEMS%,}
+          else
+            echo "Нет целей для рассылки в боевом режиме. Матрица пуста."
+            MATRIX_CONFIG_ITEMS=""
+          fi
+          
+          MATRIX_CONFIG="{\"include\": [${MATRIX_CONFIG_ITEMS}]}"
+          echo "::set-output name=matrix::${MATRIX_CONFIG}"
+          echo "Сгенерированная матрица для запуска: ${MATRIX_CONFIG}"
+
+  # Этот job будет запускаться параллельно на нескольких GHA-ранерах, каждый для СВОЕЙ ПАЧКИ писем
+  send_emails_swarm:
+    needs: prepare_dispatch
+    runs-on: ubuntu-latest # Каждый запуск будет с нового, чистого IP-адреса GitHub
+    strategy:
+      fail-fast: false # Если один ранер упадет, остальные продолжат работу
+      matrix: ${{ fromJson(needs.prepare_dispatch.outputs.matrix) }}
+      max-parallel: ${{ github.event.inputs.max_parallel_runners }} # Ограничиваем количество параллельных ранеров
+    
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Установка Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Установка зависимостей
+        run: pip install aiosmtplib
+
+      - name: Создание папки ресурсов
+        run: mkdir -p resources
+
+      - name: Загрузка файлов ресурсов
+        run: |
+          # Копируем config.py и все ресурсы в рабочий каталог ранера
+          cp config.py .
+          cp -r resources/* resources/
+
+          # Записываем аккаунты из output предыдущего job (полный список)
+          echo "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" > resources/accounts.txt
+          
+          # Извлекаем свою пачку получателей для текущего ранера
+          if [ "${{ needs.prepare_dispatch.outputs.is_test_mode }}" == "true" ]; then
+            echo "# Test mode active, mailer_worker will use TEST_EMAILS from config.py" > resources/base.txt
+          else
+            # Используем tail и head для выбора нужного диапазона получателей из общего файла
+            # Файл processed_targets_file был создан в prepare_targets
+            PROCESSED_TARGETS_FILE="${{ steps.prepare_dispatch.outputs.processed_targets_file }}"
+            OFFSET=${{ matrix.targets_offset }}
+            LIMIT=${{ matrix.targets_limit }}
+            
+            # Извлекаем нужный фрагмент
+            tail -n +$((OFFSET + 1)) "$PROCESSED_TARGETS_FILE" | head -n "$LIMIT" > resources/base.txt
+          fi
+          
+          echo "--- Содержимое файлов ресурсов после загрузки ---"
+          ls -l resources/
+          echo "resources/accounts.txt (первые 3 строки):"
+          head -n 3 resources/accounts.txt || true
+          echo "resources/base.txt (содержимое):"
+          cat resources/base.txt || true # Для пачки покажем все
+
+      - name: Запуск Swarm Email Sender
+        env:
+          GHA_ACCOUNTS: "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" # Передаем полный список аккаунтов
+          GHA_TARGETS: "$(cat resources/base.txt)" # Передаем свою пачку получателей
+          GHA_RUNNER_ID: ${{ matrix.runner_id }} # Передаем ID текущего ранера для логгирования
+        run: python mailer_worker.py
+
+      - name: Сохранение логов рассылки
+        uses: actions/upload-artifact@v3
+        with:
+          name: logs-${{ github.run_id }}-${{ matrix.runner_id }}
+          path: |
+            sent_log.csv
+            error_log.csv
+          if-no-files-found: ignore # Не падать, если логов нет
