@@ -26,26 +26,31 @@ jobs:
       matrix: ${{ steps.set_matrix.outputs.matrix }}
       all_accounts_content: ${{ steps.load_accounts.outputs.content }}
       is_test_mode: ${{ github.event.inputs.test_mode_enabled }}
-      # Добавляем output для BATCH_SIZE_PER_RUNNER
-      batch_size_per_runner_output: ${{ steps.load_config_batch_size.outputs.batch_size_per_runner }} # <-- НОВОЕ
+      batch_size_per_runner_output: ${{ steps.load_config_batch_size.outputs.batch_size_per_runner }}
+      all_targets_content: ${{ steps.prepare_targets.outputs.all_targets_content }} # <-- НОВОЕ: Передаем все цели
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v3 # Клонируем репозиторий, все файлы будут в рабочей директории
 
       - name: Загрузка всех аккаунтов
         id: load_accounts
         run: |
+          # Считываем содержимое файла accounts.txt
           ACCOUNTS_CONTENT=$(cat resources/accounts.txt)
+          # Передаем содержимое как output этого шага
           echo "::set-output name=content::$ACCOUNTS_CONTENT"
           echo "Аккаунты загружены. Количество строк: $(echo "$ACCOUNTS_CONTENT" | wc -l)"
 
       - name: Загрузка config.py для доступа к BATCH_SIZE_PER_RUNNER
-        id: load_config_batch_size # <-- НОВОЕ: Добавляем ID шагу
+        id: load_config_batch_size
         run: |
-          cp config.py .
-          # Извлекаем BATCH_SIZE_PER_RUNNER из config.py
+          # Файл config.py уже находится в рабочей директории благодаря checkout.
+          # Поэтому команды 'cp config.py .' или 'cp -r resources/* resources/' НЕ НУЖНЫ,
+          # так как они пытаются скопировать файл на самого себя, вызывая ошибку.
+          
+          # Извлекаем значение BATCH_SIZE_PER_RUNNER из config.py
           BATCH_SIZE=$(grep -oP 'BATCH_SIZE_PER_RUNNER = \K\d+' config.py)
-          # echo "BATCH_SIZE_PER_RUNNER=$BATCH_SIZE" >> $GITHUB_ENV # <-- УДАЛИТЬ ЭТУ СТРОКУ
-          echo "batch_size_per_runner=$BATCH_SIZE" >> $GITHUB_OUTPUT # <-- НОВОЕ: Записываем в output шага
+          # Передаем BATCH_SIZE как output этого шага
+          echo "batch_size_per_runner=$BATCH_SIZE" >> $GITHUB_OUTPUT
           echo "BATCH_SIZE_PER_RUNNER: $BATCH_SIZE"
 
       - name: Подготовка целей для рассылки
@@ -54,8 +59,9 @@ jobs:
           TARGETS_TO_PROCESS_FILE="targets_to_process.txt"
           if [ "${{ github.event.inputs.test_mode_enabled }}" == "true" ]; then
             echo "Работаем в тестовом режиме. Получатели будут взяты из config.py -> TEST_EMAILS."
-            # В тестовом режиме mailer_worker.py сам переключится на TEST_EMAILS
-            # Поэтому мы просто создаем пустой файл, он будет проигнорирован.
+            # В тестовом режиме mailer_worker.py сам переключится на TEST_EMAILS.
+            # Поэтому мы просто создаем пустой файл, который будет проигнорирован
+            # при нарезке, и `mailer_worker.py` будет использовать `TEST_EMAILS`.
             touch "$TARGETS_TO_PROCESS_FILE"
           else
             # Боевой режим: читаем base.txt
@@ -80,30 +86,40 @@ jobs:
             fi
           fi
           
-          # Если файл пуст, то wc -l вернет 0
           PROCESSED_TARGETS_COUNT=$(wc -l < "$TARGETS_TO_PROCESS_FILE")
           echo "Подготовлено получателей: $PROCESSED_TARGETS_COUNT"
           
-          # Сохраняем файл как артефакт, чтобы можно было посмотреть, что было отправлено
-          echo "::set-output name=processed_targets_file::$TARGETS_TO_PROCESS_FILE"
+          # НОВОЕ: Передаем содержимое всего файла целей как output этого шага.
+          # Это необходимо, чтобы затем другие job могли получить этот список и нарезать его.
+          if [ -s "$TARGETS_TO_PROCESS_FILE" ]; then
+              echo "::set-output name=all_targets_content::$(cat "$TARGETS_TO_PROCESS_FILE")"
+          else
+              echo "::set-output name=all_targets_content::" # Передаем пустую строку, если файл пуст
+          fi
 
 
       - name: Создание матрицы для GHA ранеров
         id: set_matrix
         run: |
-          # BATCH_SIZE=${{ env.BATCH_SIZE_PER_RUNNER }} # <-- УДАЛИТЬ ЭТУ СТРОКУ
-          BATCH_SIZE=${{ steps.load_config_batch_size.outputs.batch_size_per_runner }} # <-- НОВОЕ: Используем output предыдущего шага
+          # Используем output предыдущего шага для BATCH_SIZE
+          BATCH_SIZE=${{ steps.load_config_batch_size.outputs.batch_size_per_runner }}
           IS_TEST_MODE="${{ github.event.inputs.test_mode_enabled }}"
-          TARGETS_FILE_PATH="${{ steps.prepare_targets.outputs.processed_targets_file }}"
           
+          # Получаем содержимое всех целей из output этого же job (переданное выше)
+          ALL_TARGETS_CONTENT="${{ steps.prepare_targets.outputs.all_targets_content }}"
+
           MATRIX_CONFIG_ITEMS=""
           RUNNER_ID=1
 
           if [ "$IS_TEST_MODE" == "true" ]; then
             # В тестовом режиме запускаем ОДИН ранер, который сам будет использовать TEST_EMAILS
             MATRIX_CONFIG_ITEMS="{\"runner_id\": 1, \"targets_offset\": 0, \"targets_limit\": ${BATCH_SIZE}}"
-          elif [ -s "$TARGETS_FILE_PATH" ]; then # Проверяем, что файл не пустой
-            TOTAL_TARGETS=$(wc -l < "$TARGETS_FILE_PATH")
+          elif [ -n "$ALL_TARGETS_CONTENT" ]; then # Проверяем, что ALL_TARGETS_CONTENT не пустой
+            # Создаем временный файл из содержимого, чтобы посчитать строки
+            echo "$ALL_TARGETS_CONTENT" > temp_targets_for_matrix.txt
+            TOTAL_TARGETS=$(wc -l < temp_targets_for_matrix.txt)
+            rm temp_targets_for_matrix.txt # Удаляем временный файл
+            
             echo "Всего целей для разбивки на пачки: $TOTAL_TARGETS"
             
             OFFSET=0
@@ -112,7 +128,7 @@ jobs:
                 OFFSET=$((OFFSET + BATCH_SIZE))
                 ((RUNNER_ID++))
             done
-            # Удаляем последнюю запятую
+            # Удаляем последнюю запятую, если есть элементы
             MATRIX_CONFIG_ITEMS=${MATRIX_CONFIG_ITEMS%,}
           else
             echo "Нет целей для рассылки в боевом режиме. Матрица пуста."
@@ -133,7 +149,7 @@ jobs:
       max-parallel: ${{ github.event.inputs.max_parallel_runners }} # Ограничиваем количество параллельных ранеров
     
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v3 # Клонируем репозиторий, все файлы будут в рабочей директории
 
       - name: Установка Python
         uses: actions/setup-python@v4
@@ -143,30 +159,35 @@ jobs:
       - name: Установка зависимостей
         run: pip install aiosmtplib
 
-      - name: Создание папки ресурсов
-        run: mkdir -p resources
-
       - name: Загрузка файлов ресурсов
         run: |
-          # Копируем config.py и все ресурсы в рабочий каталог ранера
-          cp config.py .
-          cp -r resources/* resources/
-
-          # Записываем аккаунты из output предыдущего job (полный список)
+          # Папка resources/ и config.py уже присутствуют после actions/checkout.
+          # Создаем ее на всякий случай, если она вдруг отсутствовала бы (хотя не должна при обычном checkout).
+          mkdir -p resources
+          
+          # Записываем аккаунты из output предыдущего job (полный список).
+          # Эта команда перезапишет исходный resources/accounts.txt на каждом ранере.
           echo "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" > resources/accounts.txt
           
-          # Извлекаем свою пачку получателей для текущего ранера
+          # Обработка целей для текущего ранера:
           if [ "${{ needs.prepare_dispatch.outputs.is_test_mode }}" == "true" ]; then
             echo "# Test mode active, mailer_worker will use TEST_EMAILS from config.py" > resources/base.txt
           else
-            # Используем tail и head для выбора нужного диапазона получателей из общего файла
-            # Файл processed_targets_file был создан в prepare_targets
-            PROCESSED_TARGETS_FILE="${{ steps.prepare_dispatch.outputs.processed_targets_file }}"
+            # Получаем полное содержимое целей из prepare_dispatch job.
+            # Это содержимое было передано как output job.
+            ALL_TARGETS_CONTENT="${{ needs.prepare_dispatch.outputs.all_targets_content }}"
+            
+            # Сохраняем полное содержимое во временный файл, чтобы затем из него нарезать пачку.
+            echo "$ALL_TARGETS_CONTENT" > full_targets_temp.txt
+            
             OFFSET=${{ matrix.targets_offset }}
             LIMIT=${{ matrix.targets_limit }}
             
-            # Извлекаем нужный фрагмент
-            tail -n +$((OFFSET + 1)) "$PROCESSED_TARGETS_FILE" | head -n "$LIMIT" > resources/base.txt
+            # Извлекаем нужный фрагмент из временного файла и записываем в resources/base.txt
+            tail -n +$((OFFSET + 1)) full_targets_temp.txt | head -n "$LIMIT" > resources/base.txt
+            
+            # Удаляем временный файл после использования
+            rm full_targets_temp.txt
           fi
           
           echo "--- Содержимое файлов ресурсов после загрузки ---"
@@ -178,8 +199,10 @@ jobs:
 
       - name: Запуск Swarm Email Sender
         env:
-          GHA_ACCOUNTS: "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" # Передаем полный список аккаунтов
-          GHA_TARGETS: "$(cat resources/base.txt)" # Передаем свою пачку получателей
+          # Передаем полный список аккаунтов и текущую пачку целей как переменные окружения
+          # Вашему mailer_worker.py нужно будет считывать эти переменные.
+          GHA_ACCOUNTS: "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" 
+          GHA_TARGETS: "$(cat resources/base.txt)" # Содержимое файла resources/base.txt
           GHA_RUNNER_ID: ${{ matrix.runner_id }} # Передаем ID текущего ранера для логгирования
         run: python mailer_worker.py
 
