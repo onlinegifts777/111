@@ -49,7 +49,8 @@ jobs:
 
       - name: Загрузка config.py для доступа к BATCH_SIZE_PER_RUNNER
         run: |
-          cp config.py . # Копируем config.py в текущий каталог
+          # Файл config.py уже находится в корне рабочего каталога благодаря actions/checkout@v3.
+          # Поэтому копировать его сам на себя не нужно - строка 'cp config.py .' УДАЛЕНА.
           # Извлекаем значение BATCH_SIZE_PER_RUNNER из config.py
           # Если строка не найдена, используем значение по умолчанию (100)
           BATCH_SIZE=$(grep -oP 'BATCH_SIZE_PER_RUNNER = \K\d+' config.py || echo "100") 
@@ -166,12 +167,13 @@ jobs:
 
       - name: Загрузка файлов ресурсов
         run: |
-          cp config.py . # Копируем config.py
+          # Файл config.py уже находится в корне рабочего каталога.
+          # Поэтому копировать его сам на себя не нужно - строка 'cp config.py .' УДАЛЕНА.
           cp -r resources/* resources/ # Копируем содержимое папки resources
 
           # Записываем аккаунты, полученные как output из prepare_dispatch, в файл accounts.txt
           # Это будет полный список аккаунтов для mailer_worker.py
-          echo "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" > resources/accounts.txt
+          echo "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" | tr '|||' '\n' > resources/accounts.txt
           
           # Извлекаем свою пачку получателей для текущего ранера из скачанного файла
           if [ "${{ needs.prepare_dispatch.outputs.is_test_mode }}" == "true" ]; then
@@ -195,7 +197,9 @@ jobs:
       - name: Запуск Swarm Email Sender
         # Передаем переменные окружения в ваш Python-скрипт
         env:
-          GHA_ACCOUNTS: "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" # Полный список аккаунтов
+          # ОБНОВЛЕНИЕ ЗДЕСЬ: Теперь GHA_ACCOUNTS берется из файла resources/accounts.txt,
+          # который был правильно сформирован в предыдущем шаге.
+          GHA_ACCOUNTS: "$(cat resources/accounts.txt)"
           GHA_TARGETS: "$(cat resources/base.txt)" # Текущая пачка получателей
           GHA_RUNNER_ID: ${{ matrix.runner_id }} # ID текущего ранера для логгирования
         run: python mailer_worker.py # Запускаем ваш Python-скрипт
