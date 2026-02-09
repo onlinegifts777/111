@@ -50,7 +50,6 @@ jobs:
 
           if [ "${{ github.event.inputs.test_mode_enabled }}" == "true" ]; then
             echo "Работаем в тестовом режиме. Получатели будут взяты из config.py -> TEST_EMAILS."
-            # Создаем пустой файл-заглушку, чтобы артефакт не был пустым, но mailer_worker.py его проигнорирует в TEST_MODE
             touch "$PROCESSED_TARGETS_FILE"
           else
             if [ ! -f "$TARGETS_FILE" ]; then
@@ -73,11 +72,11 @@ jobs:
           
           PROCESSED_TARGETS_COUNT=$(wc -l < "$PROCESSED_TARGETS_FILE")
           echo "Подготовлено получателей: $PROCESSED_TARGETS_COUNT"
-          # Имя файла передаем как output
           echo "processed_targets_filename=$PROCESSED_TARGETS_FILE" >> $GITHUB_OUTPUT
 
       - name: Загрузка файла с целями как артефакта
-        uses: actions/upload-artifact@v3
+        # ИСПРАВЛЕНО: Обновлено до v4
+        uses: actions/upload-artifact@v4 
         with:
           name: targets-for-dispatch
           path: ${{ steps.prepare_targets.outputs.processed_targets_filename }}
@@ -94,11 +93,7 @@ jobs:
 
           if [ "$IS_TEST_MODE" == "true" ]; then
             MATRIX_CONFIG_ITEMS="{\"runner_id\": 1, \"targets_offset\": 0, \"targets_limit\": ${BATCH_SIZE}}"
-          elif [ -s "$TARGETS_FILENAME" ]; then # Проверяем, что файл не пустой
-            # Чтобы подсчитать строки, нужно прочитать файл. Здесь файл ещё не скачан,
-            # но мы знаем его имя и ожидаем, что он будет загружен как артефакт.
-            # Для надежности, можно было бы передать total_targets как output, но пока так.
-            # В данном случае, так как файл только что создан, он еще доступен на этом же ранере.
+          elif [ -s "$TARGETS_FILENAME" ]; then 
             TOTAL_TARGETS=$(wc -l < "$TARGETS_FILENAME")
             echo "Всего целей для разбивки на пачки: $TOTAL_TARGETS"
             
@@ -139,9 +134,9 @@ jobs:
       - name: Создание папки ресурсов
         run: mkdir -p resources
 
-      # Добавляем шаг для скачивания артефакта с целями
       - name: Скачивание файла с целями
-        uses: actions/download-artifact@v3
+        # ИСПРАВЛЕНО: Обновлено до v4
+        uses: actions/download-artifact@v4 
         with:
           name: targets-for-dispatch
           path: . # Скачиваем в текущий рабочий каталог
@@ -153,11 +148,10 @@ jobs:
 
           echo "${{ needs.prepare_dispatch.outputs.all_accounts_content }}" > resources/accounts.txt
           
-          # Извлекаем свою пачку получателей для текущего ранера из скачанного файла
           if [ "${{ needs.prepare_dispatch.outputs.is_test_mode }}" == "true" ]; then
             echo "# Test mode active, mailer_worker will use TEST_EMAILS from config.py" > resources/base.txt
           else
-            TARGETS_FILENAME="processed_targets_for_dispatch.txt" # Имя файла, который мы скачали
+            TARGETS_FILENAME="processed_targets_for_dispatch.txt" 
             OFFSET=${{ matrix.targets_offset }}
             LIMIT=${{ matrix.targets_limit }}
             
@@ -179,7 +173,8 @@ jobs:
         run: python mailer_worker.py
 
       - name: Сохранение логов рассылки
-        uses: actions/upload-artifact@v3
+        # ИСПРАВЛЕНО: Обновлено до v4
+        uses: actions/upload-artifact@v4 
         with:
           name: logs-${{ github.run_id }}-${{ matrix.runner_id }}
           path: |
